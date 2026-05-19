@@ -2573,6 +2573,22 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					finalInput = make(map[string]interface{})
 				}
 
+				// Detect truncation: if upstream Kiro/AmazonQ ended the stream before
+				// emitting any input fragment for this tool use, the input is missing
+				// or empty. Emitting an empty `{}` to the client causes the agent to
+				// hang waiting for a tool_result that will never arrive (silent fail).
+				// Fail-fast with an explicit error so the client can surface and retry.
+				truncInfo := kiroclaude.DetectTruncation(currentToolUse.Name, currentToolUse.ToolUseID, fullInput, finalInput)
+				if truncInfo.IsTruncated {
+					log.Warnf("kiro: TRUNCATION DETECTED at EOF for tool %s (ID: %s): type=%s, raw_size=%d bytes",
+						currentToolUse.Name, currentToolUse.ToolUseID, truncInfo.TruncationType, len(fullInput))
+					log.Warnf("kiro: truncation details: %s", truncInfo.ErrorMessage)
+					processedIDs[currentToolUse.ToolUseID] = true
+					out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("kiro upstream truncated tool input for %s (id=%s, type=%s): %s",
+						currentToolUse.Name, currentToolUse.ToolUseID, truncInfo.TruncationType, truncInfo.ErrorMessage)}
+					return
+				}
+
 				processedIDs[currentToolUse.ToolUseID] = true
 				contentBlockIndex++
 
