@@ -2312,6 +2312,119 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+// RequestGitLabPATToken validates a GitLab Personal Access Token and saves the auth record.
+func (h *Handler) RequestGitLabPATToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	var body struct {
+		BaseURL             string `json:"base_url"`
+		PersonalAccessToken string `json:"personal_access_token"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if body.BaseURL == "" || body.PersonalAccessToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "base_url and personal_access_token are required"})
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	authHeader := "Bearer " + body.PersonalAccessToken
+
+	// Fetch user info
+	userReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, body.BaseURL+"/api/v4/user", nil)
+	userReq.Header.Set("Authorization", authHeader)
+	userResp, err := client.Do(userReq)
+	if err != nil {
+		log.Errorf("GitLab PAT: failed to fetch user: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to contact GitLab"})
+		return
+	}
+	defer func() { _ = userResp.Body.Close() }()
+	if userResp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid personal access token"})
+		return
+	}
+	var userInfo struct {
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(userResp.Body).Decode(&userInfo); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to decode user info"})
+		return
+	}
+
+	// Fetch direct access (gateway token + model details)
+	daReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, body.BaseURL+"/api/v4/code_suggestions/direct_access", nil)
+	daReq.Header.Set("Authorization", authHeader)
+	daResp, err := client.Do(daReq)
+	if err != nil {
+		log.Errorf("GitLab PAT: failed to fetch direct access: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch direct access"})
+		return
+	}
+	defer func() { _ = daResp.Body.Close() }()
+	if daResp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "direct access endpoint unavailable"})
+		return
+	}
+	var directAccess struct {
+		BaseURL      string            `json:"base_url"`
+		Token        string            `json:"token"`
+		ExpiresAt    int64             `json:"expires_at"`
+		Headers      map[string]string `json:"headers"`
+		ModelDetails struct {
+			ModelProvider string `json:"model_provider"`
+			ModelName     string `json:"model_name"`
+		} `json:"model_details"`
+	}
+	if err := json.NewDecoder(daResp.Body).Decode(&directAccess); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to decode direct access"})
+		return
+	}
+
+	// Build and save auth record
+	metadata := map[string]any{
+		"auth_kind":            "personal_access_token",
+		"gitlab_base_url":      body.BaseURL,
+		"gitlab_user_id":       userInfo.ID,
+		"gitlab_username":      userInfo.Username,
+		"duo_gateway_base_url": directAccess.BaseURL,
+		"duo_gateway_token":    directAccess.Token,
+		"model_provider":       directAccess.ModelDetails.ModelProvider,
+		"model_name":           directAccess.ModelDetails.ModelName,
+	}
+	if len(directAccess.Headers) > 0 {
+		metadata["duo_gateway_headers"] = directAccess.Headers
+	}
+	if directAccess.ModelDetails.ModelProvider != "" && directAccess.ModelDetails.ModelName != "" {
+		metadata["model_details"] = map[string]any{
+			"model_provider": directAccess.ModelDetails.ModelProvider,
+			"model_name":     directAccess.ModelDetails.ModelName,
+		}
+	}
+
+	record := &coreauth.Auth{
+		Provider: "gitlab",
+		Status:   coreauth.StatusActive,
+		Metadata: metadata,
+	}
+
+	if _, err := h.saveTokenRecord(ctx, record); err != nil {
+		log.Errorf("GitLab PAT: failed to save token record: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save auth record"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":         "ok",
+		"model_provider": directAccess.ModelDetails.ModelProvider,
+		"model_name":     directAccess.ModelDetails.ModelName,
+	})
+}
+
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
